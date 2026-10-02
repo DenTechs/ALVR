@@ -214,34 +214,34 @@ impl SettingsTab {
 
                                 ui.end_row();
                             }
-                        })
-                });
-        }
+                        });
 
-        if self.selected_top_tab_id == "video"
-            && let Some(settings) = &self.session_settings_json
-            && let Some(video) = settings.get("video")
-            && video
-                .get("pyrowave_foveation")
-                .and_then(|value| value.get("enabled"))
-                .and_then(json::Value::as_bool)
-                == Some(true)
-        {
-            ui.group(|ui| {
-                ui.label(RichText::new("Estimated PyroWave focus bitrate").strong());
-                if let Some(required_mbps) = pyrowave_focus_bandwidth_mbps(video) {
-                    ui.label(format!(
-                        "{:.1} bpp → about {required_mbps:.1} Mbps for both eye crops. Background video and transport overhead are additional.",
-                        video["pyrowave_foveation"]["content"]["bits_per_pixel"]
-                            .as_f64()
-                            .unwrap_or_default()
-                    ));
-                } else {
-                    ui.label(
-                        "Connect a headset and set an absolute encoded view size to calculate the focus stream bandwidth.",
-                    );
-                }
-            });
+                    if self.selected_top_tab_id == "video"
+                        && let Some(settings) = &self.session_settings_json
+                        && let Some(video) = settings.get("video")
+                        && video
+                            .get("pyrowave_foveation")
+                            .and_then(|value| value.get("enabled"))
+                            .and_then(json::Value::as_bool)
+                            == Some(true)
+                    {
+                        ui.group(|ui| {
+                            ui.label(RichText::new("Estimated PyroWave focus bitrate").strong());
+                            if let Some(required_mbps) = pyrowave_focus_bandwidth_mbps(video) {
+                                ui.label(format!(
+                                    "{:.1} bpp → about {required_mbps:.1} Mbps for both eye crops. Background video and transport overhead are additional.",
+                                    video["pyrowave_foveation"]["content"]["bits_per_pixel"]
+                                        .as_f64()
+                                        .unwrap_or_default()
+                                ));
+                            } else {
+                                ui.label(
+                                    "Connect a headset and set an absolute encoded view size to calculate the focus stream bandwidth.",
+                                );
+                            }
+                        });
+                    }
+                });
         }
 
         if !path_value_pairs.is_empty() {
