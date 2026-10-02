@@ -18,12 +18,13 @@ use bindings::*;
 use alvr_common::{
     BUTTON_INFO, HAND_LEFT_ID, HAND_RIGHT_ID, HAND_TRACKER_LEFT_ID, HAND_TRACKER_RIGHT_ID, HEAD_ID,
     Pose, ViewParams, error,
+    glam::UVec2,
     parking_lot::{Mutex, RwLock},
     settings_schema::Switch,
     warn,
 };
 use alvr_filesystem as afs;
-use alvr_packets::{ButtonValue, Haptics};
+use alvr_packets::{ButtonValue, Haptics, PyrowaveFoveationPacketHeader};
 use alvr_server_core::{
     HandType, ServerCoreContext, ServerCoreEvent, ServerNegotiatedStreamingConfig,
 };
@@ -107,6 +108,7 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
 
     let foveated_encoding = negotiated.and_then(|n| n.foveated_encoding);
     let foveation_params = foveated_encoding.unwrap_or_default();
+    let pyrowave_foveation = negotiated.and_then(|n| n.pyrowave_foveation.as_ref());
 
     let (enable_color_correction, brightness, contrast, saturation, gamma, sharpening) =
         if let Switch::Enabled(config) = &video.color_correction {
@@ -173,6 +175,16 @@ fn make_settings(negotiated: Option<&ServerNegotiatedStreamingConfig>) -> Settin
             centerShifts: foveation_params.center_shifts,
             edgeRatio: foveation_params.edge_ratio,
         },
+        m_enablePyrowaveFoveation: pyrowave_foveation.is_some(),
+        m_pyrowaveChromaSubsampling: pyrowave_foveation.map_or(1, |config| {
+            match config.chroma_subsampling {
+                alvr_session::PyrowaveChromaSubsampling::Yuv420 => 0,
+                alvr_session::PyrowaveChromaSubsampling::Yuv444 => 1,
+            }
+        }),
+        m_pyrowaveRegionSize: pyrowave_foveation.map_or([0.0; 2], |config| config.region_size),
+        m_pyrowaveBitsPerPixel: pyrowave_foveation.map_or(1.0, |config| config.bits_per_pixel),
+        m_pyrowaveEdgeBlend: pyrowave_foveation.map_or(0.0, |config| config.edge_blend),
         m_enableColorCorrection: enable_color_correction,
         m_brightness: brightness,
         m_contrast: contrast,
@@ -250,18 +262,27 @@ fn spawn_event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
                 }
                 ServerCoreEvent::ClientConnected(config) => unsafe {
                     FOVEATION_CENTER_QUEUE.lock().clear();
-                    *EYE_TRACKED_FOVEATION.lock() = config
-                        .foveated_encoding
-                        .filter(|_| {
-                            alvr_server_core::settings()
-                                .headset
-                                .face_tracking
-                                .as_option()
-                                .is_some_and(|config| config.sink.eye_tracked_foveated_encoding)
-                        })
-                        .map(|params| {
-                            EyeTrackedFoveation::new(params, config.transcoding_view_resolution)
-                        });
+                    let enable_eye_tracked_ffe = alvr_server_core::settings()
+                        .headset
+                        .face_tracking
+                        .as_option()
+                        .is_some_and(|settings| settings.sink.eye_tracked_foveated_encoding);
+                    let foveated_encoding = enable_eye_tracked_ffe
+                        .then_some(config.foveated_encoding)
+                        .flatten();
+                    let pyrowave_region_size = config
+                        .pyrowave_foveation
+                        .as_ref()
+                        .map(|settings| settings.region_size);
+                    *EYE_TRACKED_FOVEATION.lock() = (foveated_encoding.is_some()
+                        || pyrowave_region_size.is_some())
+                    .then(|| {
+                        EyeTrackedFoveation::new(
+                            foveated_encoding,
+                            config.transcoding_view_resolution,
+                            pyrowave_region_size,
+                        )
+                    });
                     if InitializeStreaming(make_settings(Some(&config))) {
                         RequestDriverResync();
                     } else {
@@ -607,6 +628,25 @@ extern "C" fn get_eye_tracked_foveation_centers(timestamp_ns: u64) -> FfiFoveati
     }
 }
 
+#[repr(C)]
+struct FfiPyrowaveCropRectsResult {
+    valid: bool,
+    rects: [[f32; 4]; 2],
+}
+
+#[unsafe(export_name = "GetEyeTrackedPyrowaveCropRects")]
+extern "C" fn get_eye_tracked_pyrowave_crop_rects(timestamp_ns: u64) -> FfiPyrowaveCropRectsResult {
+    let rects = EYE_TRACKED_FOVEATION
+        .lock()
+        .as_ref()
+        .and_then(|foveation| foveation.pyrowave_crops(Duration::from_nanos(timestamp_ns)));
+
+    FfiPyrowaveCropRectsResult {
+        valid: rects.is_some(),
+        rects: rects.unwrap_or_default(),
+    }
+}
+
 #[unsafe(export_name = "ReportEncoderFoveationCenters")]
 extern "C" fn report_encoder_foveation_centers(
     timestamp_ns: u64,
@@ -670,6 +710,32 @@ extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_id
             is_idr,
             buffer.to_vec(),
         );
+    }
+}
+
+#[unsafe(export_name = "PyrowaveFoveationSend")]
+extern "C" fn pyrowave_foveation_send(
+    timestamp_ns: u64,
+    source_rects_ptr: *const [[f32; 4]; 2],
+    crop_width: u32,
+    crop_height: u32,
+    edge_blend: f32,
+    buffer_ptr: *const u8,
+    len: i32,
+) {
+    if len <= 0 || source_rects_ptr.is_null() || buffer_ptr.is_null() {
+        return;
+    }
+
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        let header = PyrowaveFoveationPacketHeader {
+            timestamp: Duration::from_nanos(timestamp_ns),
+            source_rects: unsafe { *source_rects_ptr },
+            crop_resolution: UVec2::new(crop_width, crop_height),
+            edge_blend,
+        };
+        let payload = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) }.to_vec();
+        context.send_pyrowave_foveation(header, payload);
     }
 }
 
@@ -867,7 +933,7 @@ pub extern "C" fn initialize_runtime() {
             CppInit(init_data.early_hmd_initialization, make_settings(None));
         }
 
-        let (context, events_receiver) = ServerCoreContext::new();
+        let (context, events_receiver) = ServerCoreContext::new(cfg!(alvr_pyrowave_foveation));
 
         *SERVER_CORE_CONTEXT.write() = Some(context);
 

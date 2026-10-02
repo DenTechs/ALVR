@@ -16,26 +16,36 @@ const CENTER_BOUNDARY_EPSILON: f32 = 1e-5;
 
 pub struct EyeTrackedFoveation {
     pub view_params: Option<[ViewParams; 2]>,
-    params: AlvrFoveatedEncodingParams,
+    params: Option<AlvrFoveatedEncodingParams>,
+    pyrowave_region_size: Option<Vec2>,
     // Total non-central extent on each axis, in pixels (both edges combined).
     edge_size: Vec2,
     last_update_timestamp: Option<Duration>,
     // Tracking timestamp, server event-processing time, and filtered head-local direction.
     last_valid_sample: Option<(Duration, Instant, Vec3)>,
     center_history: VecDeque<(Duration, [[f32; 2]; 2])>,
+    pyrowave_crop_history: VecDeque<(Duration, [[f32; 4]; 2])>,
 }
 
 impl EyeTrackedFoveation {
-    pub fn new(params: AlvrFoveatedEncodingParams, view_resolution: UVec2) -> Self {
+    pub fn new(
+        params: Option<AlvrFoveatedEncodingParams>,
+        view_resolution: UVec2,
+        pyrowave_region_size: Option<[f32; 2]>,
+    ) -> Self {
         let resolution = view_resolution.as_vec2();
+        let edge_size =
+            params.map(|params| resolution - Vec2::from_array(params.center_size) * resolution);
 
         Self {
             view_params: None,
             params,
-            edge_size: resolution - Vec2::from_array(params.center_size) * resolution,
+            pyrowave_region_size: pyrowave_region_size.map(Vec2::from_array),
+            edge_size: edge_size.unwrap_or(Vec2::ZERO),
             last_update_timestamp: None,
             last_valid_sample: None,
             center_history: VecDeque::new(),
+            pyrowave_crop_history: VecDeque::new(),
         }
     }
 
@@ -89,19 +99,29 @@ impl EyeTrackedFoveation {
         let Some(view_params) = self.view_params else {
             return;
         };
-        let center_size = Vec2::from_array(self.params.center_size);
+        let Some(center_size) = self
+            .params
+            .map(|params| Vec2::from_array(params.center_size))
+            .or(self.pyrowave_region_size)
+        else {
+            return;
+        };
         let [left_view, right_view] = view_params;
-        let (Some(left), Some(right)) = (
+        let (Some(left), Some(right), Some(left_uv), Some(right_uv)) = (
             project_gaze(direction, left_view, center_size),
             project_gaze(direction, right_view, center_size),
+            project_gaze_uv(direction, left_view),
+            project_gaze_uv(direction, right_view),
         ) else {
             return;
         };
         let mut centers = [left, right];
+        let gaze_uvs = [left_uv, right_uv];
 
-        if centers
-            .iter()
-            .any(|center| center.abs().cmpgt(Vec2::ONE).any())
+        if self.params.is_some()
+            && centers
+                .iter()
+                .any(|center| center.abs().cmpgt(Vec2::ONE).any())
         {
             // Constrain the shared ray before projecting it again. Clamping each eye alone can
             // move their high-density regions to different visual directions at the FOV edges.
@@ -173,8 +193,23 @@ impl EyeTrackedFoveation {
             }
         }
 
+        if let Some(region_size) = self.pyrowave_region_size {
+            let crops = gaze_uvs.map(|center_uv| {
+                let half_size = region_size * 0.5;
+                let top_left = center_uv.clamp(half_size, Vec2::ONE - half_size) - half_size;
+                [top_left.x, top_left.y, region_size.x, region_size.y]
+            });
+            self.pyrowave_crop_history.push_back((timestamp, crops));
+            while self.pyrowave_crop_history.len() > CENTER_HISTORY_CAPACITY {
+                self.pyrowave_crop_history.pop_front();
+            }
+        }
+
         let [left, right] = centers;
-        let [edge_ratio_x, edge_ratio_y] = self.params.edge_ratio;
+        let Some(params) = self.params else {
+            return;
+        };
+        let [edge_ratio_x, edge_ratio_y] = params.edge_ratio;
         // Only the right eye's X coordinate is mirrored in the packed encoder texture.
         // Per-eye quantization and the reserved boundary step can shift centers away from the
         // shared direction even when a common correction was found above.
@@ -200,12 +235,41 @@ impl EyeTrackedFoveation {
                 (*sample_timestamp == timestamp).then_some(*centers)
             })
     }
+
+    /// Return per-eye normalized crop rectangles for the exact capture timestamp.
+    pub fn pyrowave_crops(&self, timestamp: Duration) -> Option<[[f32; 4]; 2]> {
+        self.pyrowave_crop_history
+            .iter()
+            .rev()
+            .find_map(|(sample_timestamp, crops)| {
+                (*sample_timestamp == timestamp).then_some(*crops)
+            })
+    }
 }
 
 // Project a shared head-local direction into one eye; view orientation maps eye-local to head-local.
 // Eye positions are unused, so this does not model finite-distance binocular parallax.
 // Return center shifts, not UVs, before right-eye X mirroring, alignment, or clamping.
 fn project_gaze(direction: Vec3, view: ViewParams, center_size: Vec2) -> Option<Vec2> {
+    let uv = project_gaze_uv(direction, view)?;
+    let movable_fraction = Vec2::ONE - center_size;
+    let center_shift = Vec2::new(
+        if movable_fraction.x > f32::EPSILON {
+            (uv.x - 0.5) * 2.0 / movable_fraction.x
+        } else {
+            0.0
+        },
+        if movable_fraction.y > f32::EPSILON {
+            (uv.y - 0.5) * 2.0 / movable_fraction.y
+        } else {
+            0.0
+        },
+    );
+
+    center_shift.is_finite().then_some(center_shift)
+}
+
+fn project_gaze_uv(direction: Vec3, view: ViewParams) -> Option<Vec2> {
     let direction = view.pose.orientation.inverse() * direction;
     if !direction.is_finite() || direction.z >= -f32::EPSILON {
         return None;
@@ -223,21 +287,5 @@ fn project_gaze(direction: Vec3, view: ViewParams, center_size: Vec2) -> Option<
         (tangent.x - lower.x) / span.x,
         (upper.y - tangent.y) / span.y,
     );
-    // center_size is a fraction of the view: shift = (uv - 0.5) * 2 / (1 - center_size).
-    // On a movable axis, 0 centers the region and +/-1 touches a view edge; values may exceed this.
-    let movable_fraction = Vec2::ONE - center_size;
-    let center_shift = Vec2::new(
-        if movable_fraction.x > f32::EPSILON {
-            (uv.x - 0.5) * 2.0 / movable_fraction.x
-        } else {
-            0.0
-        },
-        if movable_fraction.y > f32::EPSILON {
-            (uv.y - 0.5) * 2.0 / movable_fraction.y
-        } else {
-            0.0
-        },
-    );
-
-    center_shift.is_finite().then_some(center_shift)
+    uv.is_finite().then_some(uv)
 }

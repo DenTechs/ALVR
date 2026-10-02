@@ -1,3 +1,5 @@
+#[cfg(alvr_pyrowave_foveation)]
+use crate::pyrowave::{DecodedFocusFrame, PyrowaveFoveationDecoder};
 use crate::{
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
     interaction::{self, InteractionContext, InteractionSourcesConfig},
@@ -14,11 +16,11 @@ use alvr_common::{
     glam::{UVec2, Vec2},
     parking_lot::RwLock,
 };
-use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
+use alvr_graphics::{GraphicsContext, PyrowaveFoveationFrame, StreamRenderer, StreamViewParams};
 use alvr_packets::{ClientStreamConfig, RealTimeConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
-    MediacodecProperty, PassthroughMode, UpscalingConfig,
+    MediacodecProperty, PassthroughMode, PyrowaveFoveationConfig, UpscalingConfig,
 };
 use alvr_system_info::Platform;
 use openxr as xr;
@@ -39,6 +41,7 @@ pub struct ParsedStreamConfig {
     pub enable_hdr: bool,
     pub passthrough: Option<PassthroughMode>,
     pub foveated_encoding_config: Option<AlvrFoveatedEncodingParams>,
+    pub pyrowave_foveation_config: Option<PyrowaveFoveationConfig>,
     pub clientside_foveation_config: Option<ClientsideFoveationConfig>,
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
     pub upscaling: Option<UpscalingConfig>,
@@ -58,6 +61,11 @@ impl ParsedStreamConfig {
             enable_hdr: config.negotiated_config.enable_hdr,
             passthrough: config.settings.video.passthrough.as_option().cloned(),
             foveated_encoding_config: config.negotiated_config.foveated_encoding,
+            pyrowave_foveation_config: config
+                .negotiated_config
+                .ext()
+                .ok()
+                .and_then(|ext| ext.pyrowave_foveation),
             clientside_foveation_config: config
                 .settings
                 .video
@@ -94,6 +102,12 @@ pub struct StreamContext {
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
+    #[cfg(alvr_pyrowave_foveation)]
+    pyrowave_decoder: Option<PyrowaveFoveationDecoder>,
+    #[cfg(alvr_pyrowave_foveation)]
+    last_good_pyrowave_frame: Option<DecodedFocusFrame>,
+    #[cfg(alvr_pyrowave_foveation)]
+    last_good_video_timestamp: Duration,
     use_custom_reprojection: bool,
 }
 
@@ -189,6 +203,7 @@ impl StreamContext {
             ],
             format,
             config.foveated_encoding_config,
+            config.pyrowave_foveation_config.clone(),
             !((core_ctx.platform().is_pico()
                 || (core_ctx.platform() == Platform::SamsungGalaxyXR))
                 && config.enable_hdr),
@@ -197,6 +212,25 @@ impl StreamContext {
             config.encoding_gamma,
             config.upscaling.clone(),
         );
+
+        #[cfg(alvr_pyrowave_foveation)]
+        let pyrowave_decoder =
+            config
+                .pyrowave_foveation_config
+                .as_ref()
+                .and_then(|pyrowave_config| {
+                    match PyrowaveFoveationDecoder::new(config.view_resolution, pyrowave_config) {
+                        Ok(decoder) => Some(decoder),
+                        Err(error) => {
+                            error!("Failed to initialize PyroWave focus decoder: {error}");
+                            None
+                        }
+                    }
+                });
+        #[cfg(alvr_pyrowave_foveation)]
+        if let Some(decoder) = &pyrowave_decoder {
+            core_ctx.set_pyrowave_foveation_input_callback(Box::new(decoder.input_callback()));
+        }
 
         {
             let int_ctx = interaction_ctx.read();
@@ -241,6 +275,12 @@ impl StreamContext {
             target_view_resolution,
             renderer,
             decoder: None,
+            #[cfg(alvr_pyrowave_foveation)]
+            pyrowave_decoder,
+            #[cfg(alvr_pyrowave_foveation)]
+            last_good_pyrowave_frame: None,
+            #[cfg(alvr_pyrowave_foveation)]
+            last_good_video_timestamp: Duration::ZERO,
         };
 
         this.update_reference_space();
@@ -356,6 +396,10 @@ impl StreamContext {
 
         let (timestamp, frame_metadata, buffer_ptr) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
+                #[cfg(alvr_pyrowave_foveation)]
+                {
+                    self.last_good_video_timestamp = timestamp;
+                }
                 if let Some(metadata) = self.core_context.report_compositor_start(timestamp) {
                     self.last_good_video_frame_metadata = VideoFrameMetadata {
                         foveation_center_shifts: metadata
@@ -430,24 +474,65 @@ impl StreamContext {
             openxr_display_time = vsync_time;
         }
 
+        let stream_views = [
+            StreamViewParams {
+                swapchain_index: left_swapchain_idx,
+                input_view_params: input_view_params[0],
+                output_view_params: output_view_params[0],
+            },
+            StreamViewParams {
+                swapchain_index: right_swapchain_idx,
+                input_view_params: input_view_params[1],
+                output_view_params: output_view_params[1],
+            },
+        ];
+        let foveation_center_shifts = frame_metadata
+            .foveation_center_shifts
+            .map(|centers| centers.map(Vec2::from_array));
+        #[cfg(alvr_pyrowave_foveation)]
+        {
+            let focus_timestamp = if buffer_ptr.is_null() {
+                self.last_good_video_timestamp
+            } else {
+                timestamp
+            };
+            if let Some(frame) = self
+                .pyrowave_decoder
+                .as_mut()
+                .and_then(|decoder| decoder.take_for_timestamp(focus_timestamp))
+            {
+                self.last_good_pyrowave_frame = Some(frame);
+            }
+            if self
+                .last_good_pyrowave_frame
+                .as_ref()
+                .is_some_and(|frame| frame.header.timestamp != focus_timestamp)
+            {
+                self.last_good_pyrowave_frame = None;
+            }
+            let pyrowave_frame =
+                self.last_good_pyrowave_frame
+                    .as_ref()
+                    .map(|frame| PyrowaveFoveationFrame {
+                        pixels: &frame.rgba,
+                        source_rects: frame.header.source_rects,
+                        crop_resolution: frame.header.crop_resolution,
+                        edge_blend: frame.header.edge_blend,
+                    });
+            self.renderer.render_with_pyrowave(
+                buffer_ptr,
+                stream_views,
+                self.config.passthrough.as_ref(),
+                foveation_center_shifts,
+                pyrowave_frame,
+            );
+        }
+        #[cfg(not(alvr_pyrowave_foveation))]
         self.renderer.render(
             buffer_ptr,
-            [
-                StreamViewParams {
-                    swapchain_index: left_swapchain_idx,
-                    input_view_params: input_view_params[0],
-                    output_view_params: output_view_params[0],
-                },
-                StreamViewParams {
-                    swapchain_index: right_swapchain_idx,
-                    input_view_params: input_view_params[1],
-                    output_view_params: output_view_params[1],
-                },
-            ],
+            stream_views,
             self.config.passthrough.as_ref(),
-            frame_metadata
-                .foveation_center_shifts
-                .map(|centers| centers.map(Vec2::from_array)),
+            foveation_center_shifts,
         );
 
         self.swapchains[0].release_image().unwrap();
@@ -523,6 +608,8 @@ impl Drop for StreamContext {
     fn drop(&mut self) {
         self.input_thread_running.set(false);
         self.input_thread.take().unwrap().join().ok();
+        #[cfg(alvr_pyrowave_foveation)]
+        self.core_context.clear_pyrowave_foveation_input_callback();
     }
 }
 

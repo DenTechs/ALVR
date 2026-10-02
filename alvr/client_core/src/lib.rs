@@ -28,7 +28,7 @@ use alvr_packets::{
 };
 use alvr_session::CodecType;
 use alvr_system_info::Platform;
-use connection::{ConnectionContext, DecoderCallback};
+use connection::{ConnectionContext, DecoderCallback, PyrowaveFoveationCallback};
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
@@ -71,6 +71,7 @@ pub struct ClientCapabilities {
     pub prefer_10bit: bool,
     pub preferred_encoding_gamma: f32,
     pub prefer_hdr: bool,
+    pub pyrowave_foveation: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -266,6 +267,15 @@ impl ClientCoreContext {
         if let Some(sender) = &mut *self.connection_context.control_sender.lock() {
             sender.send(&ClientControlPacket::RequestIdr).ok();
         }
+    }
+
+    /// The callback returns true when the timestamped PyroWave focus packet was accepted.
+    pub fn set_pyrowave_foveation_input_callback(&self, callback: Box<PyrowaveFoveationCallback>) {
+        *self.connection_context.pyrowave_foveation_callback.lock() = Some(callback);
+    }
+
+    pub fn clear_pyrowave_foveation_input_callback(&self) {
+        *self.connection_context.pyrowave_foveation_callback.lock() = None;
     }
 
     pub fn report_frame_decoded(&self, timestamp: Duration) {

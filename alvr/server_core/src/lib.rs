@@ -15,7 +15,7 @@ pub use connection::align_foveation_center_shift;
 pub use logging_backend::init_logging;
 pub use tracking::HandType;
 
-use crate::connection::VideoPacket;
+use crate::connection::{PyrowaveFoveationPacket, VideoPacket};
 use alvr_common::{
     AlvrFoveatedEncodingParams, ConnectionState, DEVICE_ID_TO_PATH, DeviceMotion, LifecycleState,
     Pose, ViewParams, dbg_server_core, error,
@@ -28,7 +28,7 @@ use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
     BatteryInfo, ButtonEntry, ClientConnectionsAction, DecoderInitializationConfig, Haptics,
-    VideoPacketHeader,
+    PyrowaveFoveationPacketHeader, VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
 use alvr_session::{CodecType, H264Profile, OpenvrProperty, Settings, SteamvrHmdInitConfig};
@@ -76,6 +76,7 @@ pub struct ServerNegotiatedStreamingConfig {
     pub emulated_headset_view_resolution: UVec2,
     pub refresh_rate: f32,
     pub foveated_encoding: Option<AlvrFoveatedEncodingParams>,
+    pub pyrowave_foveation: Option<alvr_session::PyrowaveFoveationConfig>,
     pub codec: CodecType,
     pub h264_profile: H264Profile,
     pub use_10bit_encoder: bool,
@@ -106,6 +107,7 @@ pub enum ServerCoreEvent {
 }
 
 pub struct ConnectionContext {
+    pub pyrowave_foveation_supported: bool,
     events_sender: mpsc::Sender<ServerCoreEvent>,
     statistics_manager: RwLock<Option<StatisticsManager>>,
     bitrate_manager: Mutex<BitrateManager>,
@@ -116,6 +118,7 @@ pub struct ConnectionContext {
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
+    pyrowave_foveation_channel_sender: Mutex<Option<SyncSender<PyrowaveFoveationPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
 
@@ -192,7 +195,7 @@ pub struct ServerCoreContext {
 }
 
 impl ServerCoreContext {
-    pub fn new() -> (Self, mpsc::Receiver<ServerCoreEvent>) {
+    pub fn new(pyrowave_foveation_supported: bool) -> (Self, mpsc::Receiver<ServerCoreEvent>) {
         dbg_server_core!("Creating");
 
         if SESSION_MANAGER
@@ -222,6 +225,7 @@ impl ServerCoreContext {
         );
 
         let connection_context = Arc::new(ConnectionContext {
+            pyrowave_foveation_supported,
             events_sender,
             statistics_manager: RwLock::new(Some(stats)),
             bitrate_manager: Mutex::new(BitrateManager::new(256, 60.0)),
@@ -234,6 +238,7 @@ impl ServerCoreContext {
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
             video_channel_sender: Mutex::new(None),
+            pyrowave_foveation_channel_sender: Mutex::new(None),
             haptics_sender: Mutex::new(None),
         });
 
@@ -481,6 +486,20 @@ impl ServerCoreContext {
                     .bitrate_manager
                     .lock()
                     .report_frame_encoded(timestamp, encoder_latency, buffer_size);
+            }
+        }
+    }
+
+    pub fn send_pyrowave_foveation(&self, header: PyrowaveFoveationPacketHeader, payload: Vec<u8>) {
+        if let Some(sender) = &*self
+            .connection_context
+            .pyrowave_foveation_channel_sender
+            .lock()
+        {
+            if let Err(TrySendError::Full(_)) =
+                sender.try_send(PyrowaveFoveationPacket { header, payload })
+            {
+                warn!("Dropping PyroWave foveation crop because its send queue is full");
             }
         }
     }

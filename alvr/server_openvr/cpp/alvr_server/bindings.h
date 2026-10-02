@@ -101,6 +101,11 @@ struct FfiFoveationCenters {
     float centerShifts[2][2];
 };
 
+struct FfiPyrowaveCropRects {
+    bool valid;
+    float rects[2][4];
+};
+
 struct Settings {
     int m_refreshRate;
     unsigned int m_renderWidth;
@@ -112,6 +117,12 @@ struct Settings {
 
     bool m_enableFoveatedEncoding;
     FfiFoveatedEncodingParams m_foveatedEncoding;
+
+    bool m_enablePyrowaveFoveation;
+    unsigned int m_pyrowaveChromaSubsampling;
+    float m_pyrowaveRegionSize[2];
+    float m_pyrowaveBitsPerPixel;
+    float m_pyrowaveEdgeBlend;
 
     bool m_enableColorCorrection;
     float m_brightness;
@@ -209,6 +220,15 @@ extern "C" void DriverReadyIdle(bool setDefaultChaprone);
 extern "C" void SetVideoConfigNals(const unsigned char* configBuffer, int len, int codec);
 extern "C" void
 VideoSend(unsigned long long targetTimestampNs, unsigned char* buf, int len, bool isIdr);
+extern "C" void PyrowaveFoveationSend(
+    unsigned long long targetTimestampNs,
+    const float sourceRects[2][4],
+    unsigned int cropWidth,
+    unsigned int cropHeight,
+    float edgeBlend,
+    const unsigned char* buf,
+    int len
+);
 extern "C" void
 HapticsSend(unsigned long long path, float duration_s, float frequency, float amplitude);
 extern "C" void ShutdownRuntime();
@@ -217,6 +237,7 @@ extern "C" void ReportPresent(unsigned long long timestamp_ns, unsigned long lon
 extern "C" void ReportComposed(unsigned long long timestamp_ns, unsigned long long offset_ns);
 extern "C" FfiDynamicEncoderParams GetDynamicEncoderParams();
 extern "C" FfiFoveationCenters GetEyeTrackedFoveationCenters(unsigned long long targetTimestampNs);
+extern "C" FfiPyrowaveCropRects GetEyeTrackedPyrowaveCropRects(unsigned long long targetTimestampNs);
 extern "C" void ReportEncoderFoveationCenters(
     unsigned long long targetTimestampNs, float leftX, float leftY, float rightX, float rightY
 );

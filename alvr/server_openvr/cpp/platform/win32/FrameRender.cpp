@@ -437,6 +437,12 @@ bool FrameRender::Startup() {
         m_pStagingTexture = colorCorrectedTexture;
     }
 
+    // Preserve the eye-tracked source before ALVR's existing FFE compacts the outer view.
+    // The optional PyroWave side encoder uses this full-resolution, color-corrected texture.
+    if (Settings_Instance()->m_enablePyrowaveFoveation && !Settings_Instance()->m_enableHdr) {
+        m_pyrowaveSourceTexture = m_pStagingTexture;
+    }
+
     enableFFE = Settings_Instance()->m_enableFoveatedEncoding;
     if (enableFFE) {
         m_ffr = std::make_unique<FFR>(m_pD3DRender->GetDevice());
@@ -883,6 +889,10 @@ bool FrameRender::RenderFrame(
 }
 
 ComPtr<ID3D11Texture2D> FrameRender::GetTexture() { return m_pStagingTexture; }
+
+ComPtr<ID3D11Texture2D> FrameRender::GetPyrowaveSourceTexture() {
+    return m_pyrowaveSourceTexture;
+}
 
 void FrameRender::GetEncodingResolution(uint32_t* width, uint32_t* height) {
     if (enableFFE) {

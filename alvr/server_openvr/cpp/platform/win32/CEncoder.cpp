@@ -16,6 +16,21 @@ CEncoder::~CEncoder() {
 void CEncoder::Initialize(std::shared_ptr<CD3DRender> d3dRender) {
     m_FrameRender = std::make_shared<FrameRender>(d3dRender);
     m_FrameRender->Startup();
+
+    if (Settings_Instance()->m_enablePyrowaveFoveation) {
+#ifdef ALVR_PYROWAVE
+        try {
+            m_pyrowaveFoveationEncoder = std::make_unique<PyrowaveFoveationEncoder>(d3dRender);
+            m_pyrowaveFoveationEncoder->Initialize();
+        } catch (Exception e) {
+            Error("PyroWave focus encoder unavailable: %s\n", e.what());
+            m_pyrowaveFoveationEncoder.reset();
+        }
+#else
+        Error("PyroWave focus encoding was negotiated but this server was built without PyroWave.\n");
+#endif
+    }
+
     uint32_t encoderWidth, encoderHeight;
     m_FrameRender->GetEncodingResolution(&encoderWidth, &encoderHeight);
 
@@ -135,6 +150,18 @@ void CEncoder::Run() {
                 m_targetTimestampNs,
                 m_scheduler.CheckIDRInsertion()
             );
+
+#ifdef ALVR_PYROWAVE
+            if (m_pyrowaveFoveationEncoder) {
+                try {
+                    m_pyrowaveFoveationEncoder->Encode(
+                        m_FrameRender->GetPyrowaveSourceTexture().Get(), m_targetTimestampNs
+                    );
+                } catch (Exception e) {
+                    Error("PyroWave focus frame failed: %s\n", e.what());
+                }
+            }
+#endif
         }
 
         m_encodeFinished.Set();
@@ -146,6 +173,9 @@ void CEncoder::Stop() {
     m_newFrameReady.Set();
     Join();
     m_FrameRender.reset();
+#ifdef ALVR_PYROWAVE
+    m_pyrowaveFoveationEncoder.reset();
+#endif
 }
 
 void CEncoder::NewFrameReady() {

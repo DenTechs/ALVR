@@ -1,6 +1,6 @@
 use alvr_common::{
     ALVR_VERSION, DebugGroupsConfig, DebugGroupsConfigDefault, LogSeverity, LogSeverityDefault,
-    LogSeverityDefaultVariant,
+    LogSeverityDefaultVariant, glam::UVec2,
 };
 use alvr_system_info::{ClientFlavor, ClientFlavorDefault, ClientFlavorDefaultVariant};
 use bytemuck::{Pod, Zeroable};
@@ -482,6 +482,65 @@ pub struct FoveatedEncodingConfig {
     pub edge_ratio: [f32; 2],
 }
 
+#[derive(SettingsSchema, Serialize, Deserialize, Clone, PartialEq)]
+#[schema(collapsible)]
+pub struct PyrowaveFoveationConfig {
+    #[serde(default)]
+    #[schema(strings(display_name = "Chroma subsampling"))]
+    pub chroma_subsampling: PyrowaveChromaSubsampling,
+
+    #[schema(strings(
+        display_name = "Focus region size",
+        help = "Width and height as fractions of each eye's encoded view"
+    ))]
+    #[schema(gui(slider(min = 0.05, max = 1.0, step = 0.01)))]
+    pub region_size: [f32; 2],
+
+    #[schema(strings(
+        display_name = "Focus bits per pixel",
+        help = "PyroWave target bits per pixel. Required bandwidth scales with region area and refresh rate."
+    ))]
+    #[schema(gui(slider(min = 0.1, max = 4.0, step = 0.1)), suffix = " bpp")]
+    pub bits_per_pixel: f32,
+
+    #[schema(strings(
+        display_name = "Edge blend width",
+        help = "Feather the PyroWave crop into the background over this fraction of the crop's shorter side"
+    ))]
+    #[schema(gui(slider(min = 0.0, max = 0.25, step = 0.01)))]
+    pub edge_blend: f32,
+}
+
+#[derive(SettingsSchema, Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[schema(gui = "button_group")]
+pub enum PyrowaveChromaSubsampling {
+    #[schema(strings(display_name = "4:2:0"))]
+    Yuv420 = 0,
+    #[default]
+    #[schema(strings(display_name = "4:4:4"))]
+    Yuv444 = 1,
+}
+
+/// Per-eye PyroWave crop dimensions. Even dimensions keep the 4:2:0 and 4:4:4
+/// encoders on the same ROI geometry and satisfy PyroWave's 4:2:0 requirement.
+pub fn pyrowave_crop_resolution(view_resolution: UVec2, region_size: [f32; 2]) -> UVec2 {
+    let dimension = |fraction: f32, extent: u32| {
+        let max_even = extent & !1;
+        if max_even == 0 {
+            return extent.max(2);
+        }
+        ((fraction * extent as f32)
+            .round()
+            .clamp(2.0, max_even as f32) as u32)
+            & !1
+    };
+
+    UVec2::new(
+        dimension(region_size[0], view_resolution.x),
+        dimension(region_size[1], view_resolution.y),
+    )
+}
+
 #[repr(C)]
 #[derive(SettingsSchema, Clone, Copy, Serialize, Deserialize, Pod, Zeroable)]
 pub struct ColorCorrectionConfig {
@@ -692,6 +751,13 @@ pub struct VideoConfig {
     ))]
     #[schema(flag = "steamvr-restart")]
     pub preferred_codec: CodecType,
+
+    #[schema(strings(
+        display_name = "Eye-tracked PyroWave focus region",
+        help = "Send a high-detail PyroWave crop for each eye over the existing background stream. Requires PyroWave support in both server and headset client."
+    ))]
+    #[schema(flag = "steamvr-restart")]
+    pub pyrowave_foveation: Switch<PyrowaveFoveationConfig>,
 
     #[schema(strings(
         notice = r"Disabling foveated encoding may result in significantly higher encode/decode times and stuttering, or even crashing.
@@ -916,9 +982,7 @@ pub enum FaceTrackingSocialPresenceSinkConfig {
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
 pub struct FaceTrackingSinkConfig {
-    #[schema(strings(
-        help = "Forward eye and face tracking to another application"
-    ))]
+    #[schema(strings(help = "Forward eye and face tracking to another application"))]
     pub social_presence: Switch<FaceTrackingSocialPresenceSinkConfig>,
     #[schema(strings(
         display_name = "Eye-tracked foveated encoding",
@@ -1786,6 +1850,21 @@ pub fn session_settings_default() -> SettingsDefault {
             },
             preferred_codec: CodecTypeDefault {
                 variant: CodecTypeDefaultVariant::H264,
+            },
+            pyrowave_foveation: SwitchDefault {
+                enabled: false,
+                content: PyrowaveFoveationConfigDefault {
+                    gui_collapsed: false,
+                    chroma_subsampling: PyrowaveChromaSubsamplingDefault {
+                        variant: PyrowaveChromaSubsamplingDefaultVariant::Yuv444,
+                    },
+                    region_size: ArrayDefault {
+                        gui_collapsed: false,
+                        content: [0.3, 0.3],
+                    },
+                    bits_per_pixel: 1.0,
+                    edge_blend: 0.08,
+                },
             },
             encoder_config: EncoderConfigDefault {
                 gui_collapsed: true,

@@ -8,6 +8,7 @@
 #include "VideoEncoderAMF.h"
 #include "VideoEncoderNVENC.h"
 #include "VideoEncoderVPL.h"
+#include "PyrowaveFoveationEncoder.h"
 #include "alvr_server/Utils.h"
 #include <d3d11.h>
 #include <d3d11_1.h>
@@ -70,6 +71,9 @@ public:
 private:
     CThreadEvent m_newFrameReady, m_encodeFinished;
     std::shared_ptr<VideoEncoder> m_videoEncoder;
+#ifdef ALVR_PYROWAVE
+    std::unique_ptr<PyrowaveFoveationEncoder> m_pyrowaveFoveationEncoder;
+#endif
     bool m_bExiting;
     uint64_t m_presentationTime;
     uint64_t m_targetTimestampNs;

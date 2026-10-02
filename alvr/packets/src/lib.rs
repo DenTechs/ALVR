@@ -6,8 +6,8 @@ use alvr_common::{
     semver::Version,
 };
 use alvr_session::{
-    ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel, SessionConfig,
-    Settings,
+    ClientsidePostProcessingConfig, CodecType, PassthroughMode, PerformanceLevel,
+    PyrowaveFoveationConfig, SessionConfig, Settings,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -25,10 +25,12 @@ pub const HAPTICS: u16 = 1;
 pub const AUDIO: u16 = 2;
 pub const VIDEO: u16 = 3;
 pub const STATISTICS: u16 = 4;
+pub const PYROWAVE_FOVEATION: u16 = 5;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct VideoStreamingCapabilitiesExt {
-    // Nothing for now
+    #[serde(default)]
+    pub pyrowave_foveation: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -56,11 +58,7 @@ impl VideoStreamingCapabilities {
     }
 
     pub fn ext(&self) -> Result<VideoStreamingCapabilitiesExt> {
-        let _ext_json = json::from_str::<json::Value>(&self.ext_str)?;
-
-        // decode values here
-
-        Ok(VideoStreamingCapabilitiesExt {})
+        Ok(json::from_str(&self.ext_str)?)
     }
 }
 
@@ -78,9 +76,10 @@ pub enum ClientConnectionResult {
     ClientStandby,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct NegotiatedStreamingConfigExt {
-    // Nothing for now
+    #[serde(default)]
+    pub pyrowave_foveation: Option<PyrowaveFoveationConfig>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -104,11 +103,7 @@ impl ClientNegotiatedStreamingConfig {
     }
 
     pub fn ext(&self) -> Result<NegotiatedStreamingConfigExt> {
-        let _ext_json = json::from_str::<json::Value>(&self.ext_str)?;
-
-        // decode values here
-
-        Ok(NegotiatedStreamingConfigExt {})
+        Ok(json::from_str(&self.ext_str)?)
     }
 }
 
@@ -247,6 +242,19 @@ pub struct VideoPacketHeader {
     /// Centers used to encode this frame, already aligned. Normally absent when FFR is disabled.
     pub foveation_center_shifts: Option<[[f32; 2]; 2]>,
     pub is_idr: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PyrowaveFoveationPacketHeader {
+    /// Must match the background frame that this pair of eye crops refines.
+    pub timestamp: Duration,
+    /// Per-eye crop rectangles in that eye's normalized source-view coordinates.
+    /// Stored as [left, top, width, height].
+    pub source_rects: [[f32; 4]; 2],
+    /// Dimensions of each decoded crop, before edge blending.
+    pub crop_resolution: UVec2,
+    /// Feather width as a fraction of the shorter crop dimension.
+    pub edge_blend: f32,
 }
 
 #[derive(Serialize, Deserialize)]

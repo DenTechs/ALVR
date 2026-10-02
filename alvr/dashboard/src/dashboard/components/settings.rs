@@ -4,7 +4,7 @@ use super::{
 };
 use crate::dashboard::ServerRequest;
 use alvr_gui_common::{DisplayString, theme};
-use alvr_session::{SessionSettings, Settings};
+use alvr_session::{FrameSize, SessionSettings, Settings, pyrowave_crop_resolution};
 use eframe::egui::{Align, Frame, Grid, Layout, RichText, ScrollArea, Ui};
 #[cfg(target_arch = "wasm32")]
 use instant::Instant;
@@ -218,10 +218,66 @@ impl SettingsTab {
                 });
         }
 
+        if self.selected_top_tab_id == "video"
+            && let Some(settings) = &self.session_settings_json
+            && let Some(video) = settings.get("video")
+            && video
+                .get("pyrowave_foveation")
+                .and_then(|value| value.get("enabled"))
+                .and_then(json::Value::as_bool)
+                == Some(true)
+        {
+            ui.group(|ui| {
+                ui.label(RichText::new("PyroWave focus bandwidth estimate").strong());
+                if let Some(required_mbps) = pyrowave_focus_bandwidth_mbps(video) {
+                    ui.label(format!(
+                        "About {required_mbps:.1} Mbps for both eye crops at the configured FPS. Background video and transport overhead are additional."
+                    ));
+                } else {
+                    ui.label(
+                        "Connect a headset and set an absolute encoded view size to calculate the focus stream bandwidth.",
+                    );
+                }
+            });
+        }
+
         if !path_value_pairs.is_empty() {
             requests.push(ServerRequest::SetSessionValues(path_value_pairs));
         }
 
         requests
     }
+}
+
+fn pyrowave_focus_bandwidth_mbps(video: &json::Value) -> Option<f64> {
+    let foveation = video.get("pyrowave_foveation")?.get("content")?;
+    let region_size = foveation.get("region_size")?.as_array()?;
+    let width_fraction = region_size.first()?.as_f64()?;
+    let height_fraction = region_size.get(1)?.as_f64()?;
+    let bits_per_pixel = foveation.get("bits_per_pixel")?.as_f64()?;
+    let fps = video.get("preferred_fps")?.as_f64()?;
+    let frame_size: FrameSize =
+        serde_json::from_value(video.get("transcoding_view_resolution")?.clone()).ok()?;
+    let headset_size: FrameSize =
+        serde_json::from_value(video.get("emulated_headset_view_resolution")?.clone()).ok()?;
+    let (headset_width, headset_height) = match headset_size {
+        FrameSize::Absolute { width, height } => (width, height.unwrap_or(width / 2)),
+        FrameSize::Scale(_) => return None,
+    };
+    let (width, height) = match frame_size {
+        FrameSize::Absolute { width, height } => (width, height.unwrap_or(width / 2)),
+        FrameSize::Scale(scale) => (
+            (headset_width as f32 * scale).round() as u32,
+            (headset_height as f32 * scale).round() as u32,
+        ),
+    };
+
+    let crop_resolution = pyrowave_crop_resolution(
+        alvr_common::glam::UVec2::new(width, height),
+        [width_fraction as f32, height_fraction as f32],
+    );
+    Some(
+        2.0 * f64::from(crop_resolution.x) * f64::from(crop_resolution.y) * bits_per_pixel * fps
+            / 1_000_000.0,
+    )
 }

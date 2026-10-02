@@ -233,6 +233,7 @@ pub extern "C" fn alvr_initialize(capabilities: AlvrClientCapabilities) {
         prefer_10bit: capabilities.prefer_10bit,
         preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
         prefer_hdr: capabilities.prefer_hdr,
+        pyrowave_foveation: false,
     };
 
     *CLIENT_CORE_CONTEXT.lock() = Some(ClientCoreContext::new(capabilities, vec![]));
@@ -722,6 +723,7 @@ pub extern "C" fn alvr_start_stream_opengl(config: AlvrStreamConfig) {
         swapchain_textures,
         SDR_FORMAT_GL,
         foveated_encoding,
+        None,
         true,
         false, // TODO: limited range fix config
         1.0,   // TODO: encoding gamma config

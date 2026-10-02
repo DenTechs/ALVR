@@ -251,7 +251,7 @@ pub unsafe extern "C" fn alvr_initialize_logging(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alvr_initialize() -> AlvrTargetConfig {
-    let (context, receiver) = ServerCoreContext::new();
+    let (context, receiver) = ServerCoreContext::new(false);
     *SERVER_CORE_CONTEXT.write() = Some(context);
     *EVENTS_RECEIVER.lock() = Some(receiver);
 

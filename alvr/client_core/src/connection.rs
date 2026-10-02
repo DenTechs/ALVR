@@ -15,8 +15,9 @@ use alvr_common::{
 };
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientControlPacket, ClientStatistics, ConnectionAcceptedInfo,
-    HAPTICS, Haptics, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader, VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
+    HAPTICS, Haptics, PYROWAVE_FOVEATION, PyrowaveFoveationPacketHeader, STATISTICS,
+    ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
+    VideoStreamingCapabilities, VideoStreamingCapabilitiesExt,
 };
 use alvr_session::{SocketProtocol, settings_schema::Switch};
 use alvr_sockets::{
@@ -55,6 +56,8 @@ const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 const VIDEO_FRAME_METADATA_HISTORY_SIZE: usize = 128;
 
 pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
+pub type PyrowaveFoveationCallback =
+    dyn FnMut(&PyrowaveFoveationPacketHeader, &[u8]) -> bool + Send;
 
 #[derive(Default)]
 pub struct ConnectionContext {
@@ -65,6 +68,7 @@ pub struct ConnectionContext {
     pub statistics_sender: Mutex<Option<StreamSender<ClientStatistics>>>,
     pub statistics_manager: Mutex<Option<StatisticsManager>>,
     pub decoder_callback: Mutex<Option<Box<DecoderCallback>>>,
+    pub pyrowave_foveation_callback: Mutex<Option<Box<PyrowaveFoveationCallback>>>,
     pub video_frame_metadata_queue: Mutex<VecDeque<(Duration, VideoFrameMetadata)>>,
     pub max_prediction: RwLock<Duration>,
 }
@@ -183,7 +187,9 @@ fn connection_pipeline(
                         prefer_hdr: capabilities.prefer_hdr,
                         ext_str: String::new(),
                     }
-                    .with_ext(VideoStreamingCapabilitiesExt {}),
+                    .with_ext(VideoStreamingCapabilitiesExt {
+                        pyrowave_foveation: capabilities.pyrowave_foveation,
+                    }),
                 ),
             },
         )))
@@ -266,6 +272,16 @@ fn connection_pipeline(
 
     let mut video_receiver =
         stream_socket.subscribe_to_stream::<VideoPacketHeader>(VIDEO, MAX_UNREAD_PACKETS);
+    let pyrowave_foveation_enabled = negotiated_config
+        .ext()
+        .ok()
+        .is_some_and(|ext| ext.pyrowave_foveation.is_some());
+    let mut pyrowave_foveation_receiver = pyrowave_foveation_enabled.then(|| {
+        stream_socket.subscribe_to_stream::<PyrowaveFoveationPacketHeader>(
+            PYROWAVE_FOVEATION,
+            MAX_UNREAD_PACKETS,
+        )
+    });
     let mut game_audio_receiver = stream_socket.subscribe_to_stream(AUDIO, MAX_UNREAD_PACKETS);
     let tracking_sender = stream_socket.request_stream(TRACKING);
     let mut haptics_receiver =
@@ -341,6 +357,34 @@ fn connection_pipeline(
             }
         }
     });
+
+    let pyrowave_foveation_receive_thread =
+        pyrowave_foveation_receiver.take().map(|mut receiver| {
+            let ctx = Arc::clone(&ctx);
+            thread::spawn(move || {
+                while is_streaming(&ctx) {
+                    let data = match receiver.recv(STREAMING_RECV_TIMEOUT) {
+                        Ok(data) => data,
+                        Err(ConnectionError::TryAgain(_)) => continue,
+                        Err(ConnectionError::Other(_)) => return,
+                    };
+                    if data.had_packet_loss() {
+                        continue;
+                    }
+                    let Ok((header, payload)) = data.get() else {
+                        return;
+                    };
+                    let submitted = ctx
+                        .pyrowave_foveation_callback
+                        .lock()
+                        .as_mut()
+                        .is_some_and(|callback| callback(&header, payload));
+                    if !submitted {
+                        warn!("Dropped PyroWave focus packet because its decoder is unavailable");
+                    }
+                }
+            })
+        });
 
     let game_audio_thread = if let Switch::Enabled(config) = settings.audio.game_audio {
         let device = alvr_audio::new_output(None).to_con()?;
@@ -581,6 +625,9 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: Destroying streams");
 
     video_receive_thread.join().ok();
+    if let Some(thread) = pyrowave_foveation_receive_thread {
+        thread.join().ok();
+    }
     game_audio_thread.join().ok();
     microphone_thread.join().ok();
     haptics_receive_thread.join().ok();

@@ -4,6 +4,8 @@ mod graphics;
 mod interaction;
 mod lobby;
 mod passthrough;
+#[cfg(alvr_pyrowave_foveation)]
+mod pyrowave;
 mod stream;
 
 use crate::stream::ParsedStreamConfig;
@@ -339,6 +341,7 @@ pub fn entry_point() {
             prefer_10bit: false,
             preferred_encoding_gamma: 1.0,
             prefer_hdr: false,
+            pyrowave_foveation: cfg!(alvr_pyrowave_foveation),
         };
 
         let permissions = {

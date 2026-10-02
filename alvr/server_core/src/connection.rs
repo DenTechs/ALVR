@@ -22,8 +22,8 @@ use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
     AUDIO, ClientConnectionResult, ClientConnectionsAction, ClientControlPacket,
     ClientNegotiatedStreamingConfig, ClientStatistics, HAPTICS, NegotiatedStreamingConfigExt,
-    RealTimeConfig, STATISTICS, ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData,
-    VIDEO, VideoPacketHeader,
+    PYROWAVE_FOVEATION, PyrowaveFoveationPacketHeader, RealTimeConfig, STATISTICS,
+    ServerControlPacket, StreamConfigPacket, TRACKING, TrackingData, VIDEO, VideoPacketHeader,
 };
 use alvr_session::{
     BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize, H264Profile, Settings,
@@ -52,6 +52,11 @@ const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
 pub struct VideoPacket {
     pub header: VideoPacketHeader,
+    pub payload: Vec<u8>,
+}
+
+pub struct PyrowaveFoveationPacket {
+    pub header: PyrowaveFoveationPacketHeader,
     pub payload: Vec<u8>,
 }
 
@@ -609,6 +614,25 @@ fn connection_pipeline(
     };
 
     let initial_settings = session_manager_lock.settings().clone();
+    let mut enable_pyrowave_foveation = initial_settings
+        .video
+        .pyrowave_foveation
+        .as_option()
+        .is_some_and(|config| {
+            config
+                .region_size
+                .iter()
+                .all(|v| v.is_finite() && (0.05..=1.0).contains(v))
+                && config.bits_per_pixel.is_finite()
+                && (0.1..=4.0).contains(&config.bits_per_pixel)
+                && config.edge_blend.is_finite()
+                && (0.0..=0.25).contains(&config.edge_blend)
+        })
+        && streaming_caps
+            .ext()
+            .ok()
+            .is_some_and(|ext| ext.pyrowave_foveation)
+        && ctx.pyrowave_foveation_supported;
 
     fn get_view_res(config: FrameSize, default_res: UVec2) -> UVec2 {
         let res = match config {
@@ -793,6 +817,21 @@ fn connection_pipeline(
         .enable
         .unwrap_or(streaming_caps.prefer_hdr);
 
+    if enable_hdr && enable_pyrowave_foveation {
+        warn!("PyroWave foveation is currently supported only for SDR streams.");
+        enable_pyrowave_foveation = false;
+    }
+
+    let pyrowave_foveation = enable_pyrowave_foveation
+        .then(|| {
+            initial_settings
+                .video
+                .pyrowave_foveation
+                .as_option()
+                .cloned()
+        })
+        .flatten();
+
     let encoding_gamma = initial_settings
         .video
         .encoder_config
@@ -862,7 +901,9 @@ fn connection_pipeline(
             wired,
             ext_str: String::new(),
         }
-        .with_ext(NegotiatedStreamingConfigExt {}),
+        .with_ext(NegotiatedStreamingConfigExt {
+            pyrowave_foveation: pyrowave_foveation.clone(),
+        }),
     )
     .to_con()?;
 
@@ -928,6 +969,8 @@ fn connection_pipeline(
 
     let control_sender = Arc::new(Mutex::new(socket.request_reliable_stream()?));
     let mut video_sender = socket.request_unreliable_stream(VIDEO);
+    let mut pyrowave_foveation_sender =
+        enable_pyrowave_foveation.then(|| socket.request_unreliable_stream(PYROWAVE_FOVEATION));
     let game_audio_sender: alvr_sockets::StreamSender<()> = socket.request_unreliable_stream(AUDIO);
     let haptics_sender = socket.request_unreliable_stream(HAPTICS);
 
@@ -942,6 +985,13 @@ fn connection_pipeline(
     let (video_channel_sender, video_channel_receiver) =
         std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
     *ctx.video_channel_sender.lock() = Some(video_channel_sender);
+    let pyrowave_foveation_channel_receiver = if enable_pyrowave_foveation {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+        *ctx.pyrowave_foveation_channel_sender.lock() = Some(sender);
+        Some(receiver)
+    } else {
+        None
+    };
     *ctx.haptics_sender.lock() = Some(haptics_sender);
 
     let video_send_thread = thread::spawn({
@@ -969,6 +1019,25 @@ fn connection_pipeline(
             }
         }
     });
+
+    let pyrowave_foveation_send_thread = pyrowave_foveation_sender
+        .take()
+        .zip(pyrowave_foveation_channel_receiver)
+        .map(|(mut sender, receiver)| {
+            let client_hostname = client_hostname.clone();
+            thread::spawn(move || {
+                while is_streaming(&client_hostname) {
+                    let PyrowaveFoveationPacket { header, payload } =
+                        match receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
+                            Ok(packet) => packet,
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        };
+
+                    sender.send_header_with_payload(&header, &payload).ok();
+                }
+            })
+        });
 
     #[cfg_attr(target_os = "linux", expect(unused_variables))]
     let game_audio_thread = if let Switch::Enabled(config) =
@@ -1457,6 +1526,7 @@ fn connection_pipeline(
                 emulated_headset_view_resolution: transcoding_view_resolution,
                 refresh_rate: fps as _,
                 foveated_encoding,
+                pyrowave_foveation,
                 codec,
                 h264_profile: encoder_profile,
                 use_10bit_encoder: enable_10_bits_encoding,
@@ -1472,6 +1542,7 @@ fn connection_pipeline(
 
     // This requests shutdown from threads
     *ctx.video_channel_sender.lock() = None;
+    *ctx.pyrowave_foveation_channel_sender.lock() = None;
     *ctx.haptics_sender.lock() = None;
 
     *ctx.video_recording_file.lock() = None;
@@ -1508,6 +1579,9 @@ fn connection_pipeline(
     // Ensure shutdown of threads
     dbg_connection!("connection_pipeline: Shutdown threads");
     video_send_thread.join().ok();
+    if let Some(thread) = pyrowave_foveation_send_thread {
+        thread.join().ok();
+    }
     game_audio_thread.join().ok();
     microphone_thread.join().ok();
     tracking_receive_thread.join().ok();

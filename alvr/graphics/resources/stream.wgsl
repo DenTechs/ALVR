@@ -12,6 +12,7 @@ override UPSCALE_EDGE_THRESHOLD: f32 = 4.0/255.0;
 override UPSCALE_EDGE_SHARPNESS: f32 = 2.0;
 
 override ENABLE_FFE: bool = false;
+override ENABLE_PYROWAVE_FOVEATION: bool = false;
 
 struct PushConstant {
     reprojection_transform: mat4x4f,
@@ -40,6 +41,15 @@ struct FoveationUniforms {
     eyes: array<FoveationEyeUniforms, 2>,
 }
 @group(0) @binding(2) var<uniform> foveation: FoveationUniforms;
+@group(0) @binding(3) var pyrowave_texture: texture_2d<f32>;
+@group(0) @binding(4) var pyrowave_sampler: sampler;
+
+struct PyrowaveUniforms {
+    left_rect: vec4f,
+    right_rect: vec4f,
+    edge_blend_enabled: vec4f,
+}
+@group(0) @binding(5) var<uniform> pyrowave: PyrowaveUniforms;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -118,6 +128,28 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         color = sgsr(vec4f(corrected_uv.x, corrected_uv.y, 0.0, 0.0), upscale_source_resolution).xyz;
     } else {
         color = textureSample(stream_texture, stream_sampler, corrected_uv).rgb;
+    }
+
+    // PyroWave uses the original source-view coordinates. The outer stream may have
+    // been compacted by FFE, so its corrected UVs must not be used for the focus crop.
+    if ENABLE_PYROWAVE_FOVEATION && pyrowave.edge_blend_enabled.z > 0.5 {
+        var crop_rect = pyrowave.left_rect;
+        if pc.view_idx == 1 {
+            crop_rect = pyrowave.right_rect;
+        }
+        let crop_uv = (uv - crop_rect.xy) / crop_rect.zw;
+        let edge_x = min(crop_uv.x, 1.0 - crop_uv.x);
+        let edge_y = min(crop_uv.y, 1.0 - crop_uv.y);
+        var fade_x = select(0.0, 1.0, edge_x >= 0.0);
+        var fade_y = select(0.0, 1.0, edge_y >= 0.0);
+        if pyrowave.edge_blend_enabled.x > 0.0 {
+            fade_x = smoothstep(0.0, pyrowave.edge_blend_enabled.x, edge_x);
+        }
+        if pyrowave.edge_blend_enabled.y > 0.0 {
+            fade_y = smoothstep(0.0, pyrowave.edge_blend_enabled.y, edge_y);
+        }
+        let focus_color = textureSample(pyrowave_texture, pyrowave_sampler, crop_uv).rgb;
+        color = mix(color, focus_color, fade_x * fade_y);
     }
 
     if ENABLE_SRGB_CORRECTION {

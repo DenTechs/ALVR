@@ -33,6 +33,7 @@ fn get_linux_x264_path() -> PathBuf {
 
 fn main() {
     let platform_name = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    println!("cargo:rustc-check-cfg=cfg(alvr_pyrowave_foveation)");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let platform_subpath = match platform_name.as_str() {
@@ -118,6 +119,32 @@ fn main() {
     #[cfg(feature = "gpl")]
     build.define("ALVR_GPL", None);
 
+    // Optional Windows-only PyroWave side encoder. Ordinary builds do not require
+    // PyroWave or Vulkan headers; set ALVR_PYROWAVE_DIR to an upstream checkout
+    // built with its shared interop library to enable it.
+    let pyrowave_dir = if platform_name == "windows" {
+        env::var("ALVR_PYROWAVE_DIR").ok().map(PathBuf::from)
+    } else {
+        None
+    };
+    if let Some(dir) = &pyrowave_dir {
+        let vulkan_headers = dir.join("Granite/third_party/khronos/vulkan-headers/include");
+        assert!(
+            dir.join("pyrowave.h").exists(),
+            "ALVR_PYROWAVE_DIR={} has no pyrowave.h",
+            dir.display()
+        );
+        assert!(
+            vulkan_headers.exists(),
+            "expected Vulkan headers at {}",
+            vulkan_headers.display()
+        );
+        build
+            .define("ALVR_PYROWAVE", None)
+            .include(dir)
+            .include(&vulkan_headers);
+    }
+
     if platform_name == "windows" {
         let vpl_path = alvr_filesystem::deps_dir().join("windows/libvpl/alvr_build");
         let vpl_include_path = vpl_path.join("include");
@@ -134,6 +161,30 @@ fn main() {
     }
 
     build.compile("bindings");
+
+    if let Some(dir) = &pyrowave_dir {
+        let lib_dir = dir.join("build-interop/Release");
+        assert!(
+            lib_dir.join("pyrowave-shared.lib").exists(),
+            "expected pyrowave-shared.lib in {}",
+            lib_dir.display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            lib_dir.to_string_lossy()
+        );
+        println!("cargo:rustc-link-lib=pyrowave-shared");
+        println!("cargo:rustc-cfg=alvr_pyrowave_foveation");
+        println!(
+            "cargo:rerun-if-changed={}",
+            dir.join("pyrowave.h").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            lib_dir.join("pyrowave-shared.lib").display()
+        );
+    }
+    println!("cargo:rerun-if-env-changed=ALVR_PYROWAVE_DIR");
 
     if platform_name == "linux" {
         #[cfg(all(target_os = "linux", feature = "gpl"))]

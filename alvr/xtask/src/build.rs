@@ -206,6 +206,18 @@ pub fn build_streamer(
             build_layout.openvr_driver_lib_dir(),
         )
         .unwrap();
+
+        if let Ok(pyrowave_dir) = env::var("ALVR_PYROWAVE_DIR") {
+            let pyrowave_dll =
+                PathBuf::from(pyrowave_dir).join("build-interop/Release/libpyrowave-shared-0.dll");
+            assert!(
+                pyrowave_dll.exists(),
+                "PyroWave was enabled but its DLL is missing: {}",
+                pyrowave_dll.display()
+            );
+            sh.copy_file(pyrowave_dll, build_layout.openvr_driver_lib_dir())
+                .unwrap();
+        }
     } else if cfg!(target_os = "linux") {
         // build compositor wrapper
         let _push_guard = sh.push_dir(afs::crate_dir("vrcompositor_wrapper"));

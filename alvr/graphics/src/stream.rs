@@ -3,17 +3,20 @@ use alvr_common::{
     AlvrFoveatedEncodingParams, ViewParams,
     glam::{Mat4, UVec2, Vec2, Vec3, Vec4},
 };
-use alvr_session::{PassthroughMode, UpscalingConfig};
+use alvr_session::{
+    PassthroughMode, PyrowaveFoveationConfig, UpscalingConfig, pyrowave_crop_resolution,
+};
 use std::{cell::Cell, ffi::c_void, iter, mem, rc::Rc};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBindingType,
-    BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, FragmentState, LoadOp,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology,
-    PushConstantRange, RenderPass, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp,
-    TextureSampleType, TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
-    include_wgsl,
+    BufferDescriptor, BufferUsages, Color, ColorTargetState, ColorWrites, Extent3d, FragmentState,
+    LoadOp, Origin3d, PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState,
+    PrimitiveTopology, PushConstantRange, RenderPass, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, SamplerBindingType,
+    SamplerDescriptor, ShaderStages, StoreOp, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
+    TextureAspect, TextureFormat, TextureSampleType, TextureView, TextureViewDescriptor,
+    TextureViewDimension, VertexState, include_wgsl,
 };
 
 const FLOAT_SIZE: u32 = mem::size_of::<f32>() as u32;
@@ -43,6 +46,16 @@ pub struct StreamViewParams {
     pub output_view_params: ViewParams,
 }
 
+pub struct PyrowaveFoveationFrame<'a> {
+    /// Side-by-side RGBA8 pixels decoded from a PyroWave frame.
+    pub pixels: &'a [u8],
+    /// Normalized [left, top, width, height] rectangles in source-view coordinates.
+    pub source_rects: [[f32; 4]; 2],
+    pub crop_resolution: UVec2,
+    /// Feather width as a fraction of the shorter crop dimension.
+    pub edge_blend: f32,
+}
+
 #[derive(Debug)]
 struct ViewObjects {
     bind_group: BindGroup,
@@ -56,6 +69,9 @@ pub struct StreamRenderer {
     views_objects: [ViewObjects; 2],
     foveated_encoding: Option<AlvrFoveatedEncodingParams>,
     foveation_buffer: Buffer,
+    pyrowave_uniform_buffer: Buffer,
+    pyrowave_focus_textures: [Texture; 2],
+    pyrowave_crop_resolution: Option<UVec2>,
     last_foveation_center_shifts: Cell<Option<[Vec2; 2]>>,
 }
 
@@ -69,6 +85,7 @@ impl StreamRenderer {
         swapchain_textures: [Vec<u32>; 2],
         target_format: u32,
         foveated_encoding: Option<AlvrFoveatedEncodingParams>,
+        pyrowave_foveation: Option<PyrowaveFoveationConfig>,
         enable_srgb_correction: bool,
         fix_limited_range: bool,
         encoding_gamma: f32,
@@ -107,6 +124,32 @@ impl StreamRenderer {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -133,6 +176,10 @@ impl StreamRenderer {
             };
 
         constants.push(("ENABLE_FFE", foveated_encoding.is_some().into()));
+        constants.push((
+            "ENABLE_PYROWAVE_FOVEATION",
+            pyrowave_foveation.is_some().into(),
+        ));
 
         let foveation_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("stream foveation uniforms"),
@@ -145,6 +192,16 @@ impl StreamRenderer {
             0,
             &foveation_uniform_bytes(&initial_foveation_uniforms),
         );
+
+        let pyrowave_uniform_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("PyroWave focus crop uniforms"),
+            size: 3 * VEC4_SIZE as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        context
+            .queue
+            .write_buffer(&pyrowave_uniform_buffer, 0, &pyrowave_uniform_bytes(None));
 
         if foveated_encoding.is_none() {
             debug_assert_eq!(staging_resolution, base_view_resolution);
@@ -214,10 +271,28 @@ impl StreamRenderer {
             ..Default::default()
         });
 
+        let pyrowave_sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let focus_resolution = pyrowave_foveation.as_ref().map_or(UVec2::ONE, |config| {
+            pyrowave_crop_resolution(base_view_resolution, config.region_size)
+        });
         let mut view_objects = vec![];
         let mut staging_textures_gl = vec![];
+        let mut focus_textures = vec![];
+        let focus_format = if target_format == TextureFormat::Rgba16Float {
+            TextureFormat::Rgba8UnormSrgb
+        } else {
+            target_format
+        };
         for target_swapchain in &swapchain_textures {
             let staging_texture = super::create_texture(device, staging_resolution, target_format);
+            // Match the SDR staging texture's sample conversion. Decoded focus
+            // pixels are RGBA8 even when the output swapchain is RGBA16F.
+            let focus_texture = super::create_texture(device, focus_resolution, focus_format);
 
             let bind_group = device.create_bind_group(&BindGroupDescriptor {
                 label: None,
@@ -237,6 +312,20 @@ impl StreamRenderer {
                         binding: 2,
                         resource: foveation_buffer.as_entire_binding(),
                     },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::TextureView(
+                            &focus_texture.create_view(&TextureViewDescriptor::default()),
+                        ),
+                    },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: BindingResource::Sampler(&pyrowave_sampler),
+                    },
+                    BindGroupEntry {
+                        binding: 5,
+                        resource: pyrowave_uniform_buffer.as_entire_binding(),
+                    },
                 ],
             });
 
@@ -251,6 +340,7 @@ impl StreamRenderer {
                 bind_group,
                 render_target,
             });
+            focus_textures.push(focus_texture);
 
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
@@ -281,6 +371,9 @@ impl StreamRenderer {
             views_objects: view_objects.try_into().unwrap(),
             foveated_encoding,
             foveation_buffer,
+            pyrowave_uniform_buffer,
+            pyrowave_focus_textures: focus_textures.try_into().unwrap(),
+            pyrowave_crop_resolution: pyrowave_foveation.map(|_| focus_resolution),
             last_foveation_center_shifts: Cell::new(None),
         }
     }
@@ -296,10 +389,71 @@ impl StreamRenderer {
         passthrough: Option<&PassthroughMode>,
         foveation_center_shifts: Option<[Vec2; 2]>,
     ) {
+        self.render_with_pyrowave(
+            hardware_buffer,
+            view_params,
+            passthrough,
+            foveation_center_shifts,
+            None,
+        );
+    }
+
+    pub fn render_with_pyrowave(
+        &self,
+        hardware_buffer: *mut c_void,
+        view_params: [StreamViewParams; 2],
+        passthrough: Option<&PassthroughMode>,
+        foveation_center_shifts: Option<[Vec2; 2]>,
+        pyrowave_frame: Option<PyrowaveFoveationFrame<'_>>,
+    ) {
         // if hardware_buffer is available copy stream to staging texture
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);
         }
+
+        let expected_focus_bytes = self
+            .pyrowave_crop_resolution
+            // The decoder returns a side-by-side atlas: two RGBA8 crops per row.
+            .map(|resolution| resolution.x as usize * resolution.y as usize * 8);
+        let pyrowave_frame =
+            pyrowave_frame.filter(|frame| expected_focus_bytes == Some(frame.pixels.len()));
+
+        if let (Some(frame), Some(resolution)) = (&pyrowave_frame, self.pyrowave_crop_resolution) {
+            let atlas_width = resolution.x * 2;
+            let row_bytes = resolution.x as usize * 4;
+            for eye in 0..2 {
+                let mut eye_pixels = Vec::with_capacity(row_bytes * resolution.y as usize);
+                for row in 0..resolution.y as usize {
+                    let start = (row * atlas_width as usize + eye * resolution.x as usize) * 4;
+                    eye_pixels.extend_from_slice(&frame.pixels[start..start + row_bytes]);
+                }
+                self.context.queue.write_texture(
+                    TexelCopyTextureInfo {
+                        texture: &self.pyrowave_focus_textures[eye],
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    &eye_pixels,
+                    TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_bytes as u32),
+                        rows_per_image: Some(resolution.y),
+                    },
+                    Extent3d {
+                        width: resolution.x,
+                        height: resolution.y,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+
+        self.context.queue.write_buffer(
+            &self.pyrowave_uniform_buffer,
+            0,
+            &pyrowave_uniform_bytes(pyrowave_frame.as_ref()),
+        );
 
         if let Some(config) = &self.foveated_encoding
             && self.last_foveation_center_shifts.get() != foveation_center_shifts
@@ -565,6 +719,32 @@ fn foveation_uniform_bytes(
         chunk.copy_from_slice(&value.to_ne_bytes());
     }
 
+    bytes
+}
+
+fn pyrowave_uniform_bytes(frame: Option<&PyrowaveFoveationFrame>) -> [u8; 3 * VEC4_SIZE as usize] {
+    let mut uniforms = [Vec4::ZERO; 3];
+    if let Some(frame) = frame {
+        uniforms[0] = Vec4::from_array(frame.source_rects[0]);
+        uniforms[1] = Vec4::from_array(frame.source_rects[1]);
+        let shorter_side = frame.crop_resolution.min_element().max(1) as f32;
+        uniforms[2] = Vec4::new(
+            frame.edge_blend.clamp(0.0, 0.25) * shorter_side
+                / frame.crop_resolution.x.max(1) as f32,
+            frame.edge_blend.clamp(0.0, 0.25) * shorter_side
+                / frame.crop_resolution.y.max(1) as f32,
+            1.0,
+            0.0,
+        );
+    }
+
+    let mut bytes = [0; 3 * VEC4_SIZE as usize];
+    for (chunk, value) in bytes
+        .chunks_exact_mut(mem::size_of::<f32>())
+        .zip(uniforms.iter().flat_map(|value| value.to_array()))
+    {
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
     bytes
 }
 
