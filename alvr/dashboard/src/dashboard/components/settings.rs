@@ -228,13 +228,10 @@ impl SettingsTab {
                 == Some(true)
         {
             ui.group(|ui| {
-                ui.label(RichText::new("Estimated PyroWave focus bitrate").strong());
+                ui.label(RichText::new("PyroWave focus bandwidth estimate").strong());
                 if let Some(required_mbps) = pyrowave_focus_bandwidth_mbps(video) {
                     ui.label(format!(
-                        "{:.1} bpp → about {required_mbps:.1} Mbps for both eye crops. Background video and transport overhead are additional.",
-                        video["pyrowave_foveation"]["content"]["bits_per_pixel"]
-                            .as_f64()
-                            .unwrap_or_default()
+                        "About {required_mbps:.1} Mbps for both eye crops at the configured FPS. Background video and transport overhead are additional."
                     ));
                 } else {
                     ui.label(
@@ -254,11 +251,7 @@ impl SettingsTab {
 
 fn pyrowave_focus_bandwidth_mbps(video: &json::Value) -> Option<f64> {
     let foveation = video.get("pyrowave_foveation")?.get("content")?;
-    let region_size_value = foveation.get("region_size")?;
-    let region_size = region_size_value
-        .get("content")
-        .and_then(json::Value::as_array)
-        .or_else(|| region_size_value.as_array())?;
+    let region_size = foveation.get("region_size")?.as_array()?;
     let width_fraction = region_size.first()?.as_f64()?;
     let height_fraction = region_size.get(1)?.as_f64()?;
     let bits_per_pixel = foveation.get("bits_per_pixel")?.as_f64()?;
