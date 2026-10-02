@@ -321,7 +321,19 @@ pub fn filesystem_layout_from_dashboard_exe(path: &Path) -> Option<Layout> {
             path.parent()?.to_owned()
         };
 
-        Some(Layout::new(&root))
+        let layout = Layout::new(&root);
+        if layout.openvr_driver_manifest().is_file() {
+            return Some(layout);
+        }
+
+        // A cargo-built dashboard lives in target/<profile>, while its driver and
+        // other runtime files live in the packaged streamer directory.
+        let dev_layout = Layout::new(&streamer_build_dir());
+        Some(if dev_layout.openvr_driver_manifest().is_file() {
+            dev_layout
+        } else {
+            layout
+        })
     })
 }
 
